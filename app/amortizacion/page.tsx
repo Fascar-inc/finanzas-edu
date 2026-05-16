@@ -20,6 +20,8 @@ const formatCOP = (n: number) =>
     maximumFractionDigits: 0,
   }).format(n)
 
+// ─── helpers sin cambios (para downloadExcel / referencia) ───────────────────
+
 function fixedQuota(principal: number, ea: number, months: number): Row[] {
   const r = Math.pow(1 + ea / 100, 1 / 12) - 1
   const payment = principal * ((r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1))
@@ -38,7 +40,6 @@ function fixedQuota(principal: number, ea: number, months: number): Row[] {
       balance: Math.max(0, Math.round(balance)),
     })
   }
-
   return rows
 }
 
@@ -60,34 +61,57 @@ function decreasingQuota(principal: number, ea: number, months: number): Row[] {
       balance: Math.max(0, Math.round(balance)),
     })
   }
-
   return rows
 }
 
-function withExtraAbono(
-  baseRows: Row[],
+// ─── NUEVO: generador unificado COP con abono real ───────────────────────────
+/**
+ * Construye la tabla de amortización en COP, aplicando correctamente
+ * el abono mensual a capital y sumando seguro + cuota de manejo al pago mostrado.
+ * `extraMonthly = 0` reproduce exactamente fixedQuota / decreasingQuota + fees.
+ */
+function buildCOPRows(
   principal: number,
   ea: number,
-  extraMonthly: number
+  months: number,
+  system: 'fixed' | 'decreasing',
+  extraMonthly: number,
+  ins: number,
+  fee: number,
 ): Row[] {
   const r = Math.pow(1 + ea / 100, 1 / 12) - 1
+
+  // Cuota pura de amortización (sin seguros ni manejo)
+  const fixedPayment =
+    system === 'fixed'
+      ? principal * ((r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1))
+      : 0
+  const regularPrincipal = system === 'decreasing' ? principal / months : 0
+
   const rows: Row[] = []
   let balance = principal
   let period = 1
 
-  while (balance > 0 && period <= 1200) {
+  while (balance > 0.5 && period <= 1200) {
     const interest = balance * r
-    const basePayment = baseRows[0]?.payment || 0
-    const totalPayment = basePayment + extraMonthly
-    const principalPaid = Math.min(balance, totalPayment - interest)
-    balance -= principalPaid
+
+    // Capital abonado = porción de capital de la cuota regular + abono extra
+    // Se limita al saldo pendiente para no pasarse
+    let principalPaid: number
+    if (system === 'fixed') {
+      principalPaid = Math.max(0, Math.min(balance, fixedPayment - interest + extraMonthly))
+    } else {
+      principalPaid = Math.min(balance, regularPrincipal + extraMonthly)
+    }
+
+    balance = Math.max(0, balance - principalPaid)
 
     rows.push({
       period,
-      payment: Math.round(totalPayment),
+      payment: Math.round(principalPaid + interest + ins + fee),
       interest: Math.round(interest),
       principal: Math.round(principalPaid),
-      balance: Math.max(0, Math.round(balance)),
+      balance: Math.round(balance),
     })
 
     period++
@@ -95,6 +119,79 @@ function withExtraAbono(
 
   return rows
 }
+
+// ─── NUEVO: generador UVR real ────────────────────────────────────────────────
+/**
+ * Construye la tabla de amortización en UVR:
+ *  - El saldo se mantiene en UVR, proyectando mes a mes con uvrGrowthAnnual.
+ *  - La cuota y el saldo se convierten a pesos usando la UVR proyectada.
+ *  - El abono extra (en COP) se convierte a UVR cada mes según la UVR vigente.
+ *  - uvrInitial y uvrGrowthAnnual afectan directamente todos los resultados.
+ */
+function buildUVRRows(
+  principalCOP: number,
+  ea: number,
+  months: number,
+  system: 'fixed' | 'decreasing',
+  uvrInitial: number,
+  uvrGrowthAnnual: number,
+  extraMonthlyCOP: number,
+  ins: number,
+  fee: number,
+): Row[] {
+  const r = Math.pow(1 + ea / 100, 1 / 12) - 1
+  const monthlyGrowth = Math.pow(1 + uvrGrowthAnnual / 100, 1 / 12) - 1
+
+  // Saldo inicial en UVR
+  const principalUvr = principalCOP / uvrInitial
+
+  // Cuota fija en UVR (si aplica)
+  const fixedPaymentUvr =
+    system === 'fixed'
+      ? principalUvr * ((r * Math.pow(1 + r, months)) / (Math.pow(1 + r, months) - 1))
+      : 0
+  const regularPrincipalUvr = system === 'decreasing' ? principalUvr / months : 0
+
+  const rows: Row[] = []
+  let balanceUvr = principalUvr
+  let currentUvr = uvrInitial
+  let period = 1
+
+  while (balanceUvr > 0.0001 && period <= 1200) {
+    // Proyectar UVR al mes actual
+    currentUvr *= 1 + monthlyGrowth
+
+    const interestUvr = balanceUvr * r
+    // Convertir el abono extra de COP a UVR usando la UVR del mes
+    const extraUvr = extraMonthlyCOP / currentUvr
+
+    let principalPaidUvr: number
+    if (system === 'fixed') {
+      principalPaidUvr = Math.max(
+        0,
+        Math.min(balanceUvr, fixedPaymentUvr - interestUvr + extraUvr),
+      )
+    } else {
+      principalPaidUvr = Math.min(balanceUvr, regularPrincipalUvr + extraUvr)
+    }
+
+    balanceUvr = Math.max(0, balanceUvr - principalPaidUvr)
+
+    rows.push({
+      period,
+      payment: Math.round((principalPaidUvr + interestUvr) * currentUvr + ins + fee),
+      interest: Math.round(interestUvr * currentUvr),
+      principal: Math.round(principalPaidUvr * currentUvr),
+      balance: Math.round(balanceUvr * currentUvr),
+    })
+
+    period++
+  }
+
+  return rows
+}
+
+// ─── Componente principal ────────────────────────────────────────────────────
 
 export default function AmortizacionPage() {
   const [creditName, setCreditName] = useState('')
@@ -145,72 +242,75 @@ export default function AmortizacionPage() {
       return
     }
 
-    const base = system === 'fixed' ? fixedQuota(p, rate, m) : decreasingQuota(p, rate, m)
-    const adjustedBase = base.map((r) => ({
-      ...r,
-      payment: Math.round(r.payment + ins + fee),
-    }))
-
-    let finalRows = adjustedBase
-    let savedMonths = 0
-
-    if (extra > 0 && system === 'fixed') {
-      finalRows = withExtraAbono(adjustedBase, p, rate, extra).map((r) => ({
-        ...r,
-        payment: Math.round(r.payment + ins + fee),
-      }))
-      savedMonths = adjustedBase.length - finalRows.length
+    // ── Validación: abono no puede superar el monto del préstamo ──
+    if (extra > 0 && extra >= p) {
+      setError(
+        `El abono mensual a capital (${formatCOP(extra)}) no puede ser mayor o igual al monto del préstamo (${formatCOP(p)}). Ingresa un valor menor.`,
+      )
+      return
     }
 
-    if (currency === 'UVR') {
+    if (currency === 'COP') {
+      // Escenario base (sin abono extra) para calcular el ahorro
+      const noExtraRows = buildCOPRows(p, rate, m, system, 0, ins, fee)
+      // Escenario con abono
+      const finalRows = extra > 0 ? buildCOPRows(p, rate, m, system, extra, ins, fee) : noExtraRows
+
+      setBaseRows(noExtraRows)
+      setRows(finalRows)
+
+      const totalPaid = finalRows.reduce((s, r) => s + r.payment, 0)
+      const totalInterest = finalRows.reduce((s, r) => s + r.interest, 0)
+      const baseTotalInterest = noExtraRows.reduce((s, r) => s + r.interest, 0)
+      const savedMonths = noExtraRows.length - finalRows.length
+
+      setSummary({
+        totalPaid,
+        totalInterest,
+        firstPayment: finalRows[0]?.payment || 0,
+        savedInterest: Math.max(0, baseTotalInterest - totalInterest),
+        savedMonths: Math.max(0, savedMonths),
+        baseTotalInterest,
+        baseMonths: noExtraRows.length,
+      })
+    } else {
+      // ── UVR ──
       const uvr = Number(uvrValue)
       const growth = Number(uvrGrowth || 0)
-      const monthlyGrowth = Math.pow(1 + growth / 100, 1 / 12) - 1
-      const uvrRows: Row[] = []
-      let balanceUvr = p / uvr
-      let currentUvr = uvr
 
-      for (let i = 1; i <= m; i++) {
-        currentUvr *= 1 + monthlyGrowth
-        const interestUvr = balanceUvr * (Math.pow(1 + rate / 100, 1 / 12) - 1)
-        const principalPaidUvr = p / uvr / m
-        balanceUvr = Math.max(0, balanceUvr - principalPaidUvr)
+      // Escenario base UVR (sin abono extra)
+      const baseUvrRows = buildUVRRows(p, rate, m, system, uvr, growth, 0, ins, fee)
+      // Escenario con abono
+      const finalRows =
+        extra > 0 ? buildUVRRows(p, rate, m, system, uvr, growth, extra, ins, fee) : baseUvrRows
 
-        uvrRows.push({
-          period: i,
-          payment: Math.round((principalPaidUvr + interestUvr) * currentUvr + ins + fee),
-          interest: Math.round(interestUvr * currentUvr),
-          principal: Math.round(principalPaidUvr * currentUvr),
-          balance: Math.round(balanceUvr * currentUvr),
-        })
-      }
+      setBaseRows(baseUvrRows)
+      setRows(finalRows)
 
-      finalRows = uvrRows
-      savedMonths = 0
+      const totalPaid = finalRows.reduce((s, r) => s + r.payment, 0)
+      const totalInterest = finalRows.reduce((s, r) => s + r.interest, 0)
+      const baseTotalInterest = baseUvrRows.reduce((s, r) => s + r.interest, 0)
+      const savedMonths = baseUvrRows.length - finalRows.length
+
+      setSummary({
+        totalPaid,
+        totalInterest,
+        firstPayment: finalRows[0]?.payment || 0,
+        savedInterest: Math.max(0, baseTotalInterest - totalInterest),
+        savedMonths: Math.max(0, savedMonths),
+        baseTotalInterest,
+        baseMonths: baseUvrRows.length,
+      })
     }
 
-    setBaseRows(adjustedBase)
-    setRows(finalRows)
-
-    const totalPaid = finalRows.reduce((s, r) => s + r.payment, 0)
-    const totalInterest = finalRows.reduce((s, r) => s + r.interest, 0)
-    const baseTotalInterest = adjustedBase.reduce((s, r) => s + r.interest, 0)
-
-    setSummary({
-      totalPaid,
-      totalInterest,
-      firstPayment: finalRows[0]?.payment || 0,
-      savedInterest: Math.max(0, baseTotalInterest - totalInterest),
-      savedMonths,
-      baseTotalInterest,
-      baseMonths: adjustedBase.length,
-    })
     setSaved(false)
   }
 
   const saveTable = async () => {
     const supabase = createClient()
-    const { data: { user } } = await supabase.auth.getUser()
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
 
     if (!user) {
       setError('Debes iniciar sesión para guardar la tabla.')
@@ -505,6 +605,7 @@ export default function AmortizacionPage() {
               <p className="text-sm text-blue-600 font-medium mb-1">Primera cuota</p>
               <p className="text-2xl font-bold text-blue-700">{formatCOP(summary.firstPayment)}</p>
             </div>
+
             <div className="bg-orange-50 rounded-2xl p-5 border border-orange-100">
               <p className="text-sm text-orange-600 font-medium mb-1">Total de intereses</p>
               <p className="text-2xl font-bold text-orange-700">{formatCOP(summary.totalInterest)}</p>
@@ -514,6 +615,7 @@ export default function AmortizacionPage() {
                 </p>
               )}
             </div>
+
             <div className="bg-green-50 rounded-2xl p-5 border border-green-100">
               <p className="text-sm text-green-600 font-medium mb-1">Total a pagar</p>
               <p className="text-2xl font-bold text-green-700">{formatCOP(summary.totalPaid)}</p>
@@ -522,6 +624,26 @@ export default function AmortizacionPage() {
               )}
             </div>
           </div>
+
+          {/* Tarjeta de ahorro: solo visible cuando extraAbono > 0 */}
+          {Number(extraAbono) > 0 && (
+            <div className="bg-slate-50 rounded-2xl p-5 border border-slate-200 mb-6">
+              <p className="text-sm text-slate-600 font-medium mb-1">Ahorro por abono a capital</p>
+              <p className="text-2xl font-bold text-slate-800">
+                {formatCOP(summary.savedInterest)}
+              </p>
+              {summary.savedMonths > 0 && (
+                <p className="text-xs text-slate-500 mt-1">
+                  Meses ahorrados: {summary.savedMonths}
+                </p>
+              )}
+              {summary.savedInterest === 0 && (
+                <p className="text-xs text-slate-400 mt-1">
+                  El abono no generó ahorro en intereses en este escenario.
+                </p>
+              )}
+            </div>
+          )}
 
           <div className="bg-white rounded-2xl p-6 shadow-sm border border-gray-100">
             <div className="flex items-center justify-between mb-4">
