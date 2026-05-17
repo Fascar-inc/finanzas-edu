@@ -4,7 +4,7 @@ import { useEffect, useState, useMemo } from 'react'
 import { createClient } from '@/lib/supabase'
 import { CATEGORIES } from '@/lib/categories'
 import Link from 'next/link'
-import EmojiPicker from '@/components/EmojiPicker'
+import EmojiPicker from '@/Components/EmojiPicker'
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
